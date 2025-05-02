@@ -11,6 +11,7 @@ import io
 import base64
 import json
 import time
+from flask_cors import CORS
 # pillow library for image
 
 # Load environment variables
@@ -19,12 +20,12 @@ load_dotenv()
 # GPT API Key
 gpt_client = OpenAI(
     base_url="https://models.inference.ai.azure.com",
-    api_key=os.environ["GPT_GITHUB_KEY"]
+    api_key="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" #os.environ["GPT_GITHUB_KEY"]
 )
 
 hf_client = InferenceClient(
     provider="nebius",
-    api_key=os.environ["HUGGING_FACE_TOKEN"],
+    api_key="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" #os.environ["HUGGING_FACE_TOKEN"],
 )
 
 app = Flask(__name__)
@@ -191,4 +192,5 @@ def inside_view():
         
 
 if __name__ == "__main__":
+    CORS(app)
     app.run(host="0.0.0.0", port=5000)
