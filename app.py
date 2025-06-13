@@ -3,37 +3,41 @@ from google.cloud import vision
 import subprocess
 import os
 import cv2
-import requests
-from dotenv import load_dotenv
-from openai import OpenAI
-from huggingface_hub import InferenceClient
 import io
 import base64
 import json
 import time
+from dotenv import load_dotenv
 from flask_cors import CORS
-# pillow library for image
+from openai import OpenAI
+from huggingface_hub import InferenceClient
 
+from door_monitor import start_door_monitoring, get_door_status
+from door_closing import close_door
+from door_lock import lock_door, unlock_door
+
+door_is_locked = False
 # Load environment variables
 load_dotenv()
 
-# GPT API Key
+# Google Cloud credentials
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
+
+# Clients
 gpt_client = OpenAI(
     base_url="https://models.inference.ai.azure.com",
-    api_key="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" #os.environ["GPT_GITHUB_KEY"]
+    api_key=os.environ["GPT_GITHUB_KEY"],
 )
 
 hf_client = InferenceClient(
     provider="nebius",
-    api_key="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" #os.environ["HUGGING_FACE_TOKEN"],
+    api_key=os.environ["HUGGING_FACE_TOKEN"],
 )
 
 app = Flask(__name__)
+CORS(app)
 
-# Set Google Cloud credentials
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
-
-# Load the valid food names from a file
+# Load valid food names
 def load_food_names():
     with open("food_names.txt", "r") as file:
         return set(line.strip().lower() for line in file)
@@ -41,13 +45,11 @@ def load_food_names():
 valid_food_names = load_food_names()
 
 def capture_image():
-    """Captures an image from the camera."""
     image_path = "image.jpg"
     subprocess.run(["libcamera-jpeg", "-o", image_path])
     return image_path
 
 def detect_labels(image_path):
-    """Detects objects and returns the highest-scoring valid food label."""
     client = vision.ImageAnnotatorClient()
 
     with open(image_path, "rb") as image_file:
@@ -59,7 +61,6 @@ def detect_labels(image_path):
 
     original_image = cv2.imread(image_path)
     height, width, _ = original_image.shape
-
     results = []
 
     for obj in localized_objects:
@@ -70,35 +71,25 @@ def detect_labels(image_path):
         y_max = int(vertices[2].y * height)
 
         cropped_image = original_image[y_min:y_max, x_min:x_max]
-        _, cropped_image_buffer = cv2.imencode('.jpg', cropped_image)
-        cropped_image_content = cropped_image_buffer.tobytes()
+        _, buffer = cv2.imencode('.jpg', cropped_image)
+        cropped_image_content = buffer.tobytes()
 
-        cropped_image_vision = vision.Image(content=cropped_image_content)
-        labels_response = client.label_detection(image=cropped_image_vision)
-        labels = labels_response.label_annotations
-
-        valid_labels = [label for label in labels if label.description.lower() in valid_food_names]
+        label_resp = client.label_detection(image=vision.Image(content=cropped_image_content))
+        valid_labels = [label for label in label_resp.label_annotations if label.description.lower() in valid_food_names]
         if valid_labels:
-            best_label = max(valid_labels, key=lambda label: label.score)
+            best_label = max(valid_labels, key=lambda l: l.score)
             results.append(best_label.description)
 
     return results
 
-@app.route("/food_recognition")
+@app.route("/food-recognition")
 def food_recognition():
     try:
         image_path = capture_image()
-        objects_with_best_label = detect_labels(image_path)
-
-        return jsonify({
-            "status": "success",
-            "objects": objects_with_best_label
-        })
+        detected_items = detect_labels(image_path)
+        return jsonify({"status": "success", "objects": detected_items})
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/recipe-suggestion", methods=["POST"])
 def recipe_suggestion():
@@ -111,7 +102,8 @@ def recipe_suggestion():
         Return a valid JSON object in this exact format:
         {{
           "recipe_name": "A name for the suggested dish",
-          "recipe_image": "a description of the dish for image generation"
+          "time": "an integer that represents the preparation time in minutes",
+          "recipe_image": "a description of the dish for image generation",
           "ingredients": {{
             "available": ["List", "of", "ingredients", "present"],
             "missing": ["List", "of", "ingredients needed for the recipe", " but not", "available in our fridge"]
@@ -121,7 +113,6 @@ def recipe_suggestion():
         Make sure the response is ONLY a JSON object (no explanations or comments).
         """
 
-        # Step 1: Get the recipe from GPT
         response = gpt_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "You are a helpful recipe assistant."},
@@ -133,64 +124,92 @@ def recipe_suggestion():
             top_p=1
         )
 
-        print(response.choices[0].message.content)
-        recipe_text = response.choices[0].message.content.strip()
-        recipe_json = json.loads(recipe_text)  # Parse GPT JSON safely
+        recipe_json = json.loads(response.choices[0].message.content.strip())
 
-        # Step 2: Use recipe_name to generate an image with FLUX
-        recipe_placeholder = recipe_json["recipe_image"]
-        image = hf_client.text_to_image(recipe_placeholder, model="black-forest-labs/FLUX.1-schnell") # output is a PIL.Image object
-
-        # Step 3: Save to Desktop and convert to base64
-        image_path = "/home/JSL/Desktop/FridgeX/recipe_image.png"  
-        image.save(image_path, format='PNG') # save for testing
+        image = hf_client.text_to_image(recipe_json["recipe_image"], model="black-forest-labs/FLUX.1-schnell")
         image_io = io.BytesIO()
         image.save(image_io, format='PNG')
-        image_base64 = base64.b64encode(image_io.getvalue()).decode('utf-8') # convert to base64
+        image_base64 = base64.b64encode(image_io.getvalue()).decode('utf-8')
 
-        print(recipe_json)
-
-        # Step 4: Return full response with base64 image instead of just URL
-        return ({
+        return {
             "status": 200,
             "recipe": recipe_json,
             "recipe_image": image_base64,
-        })
-
-        #return jsonify({
-        #    "status": "success",
-        #    "recipe": recipe_text
-        #})
-
+        }
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-        
+
 @app.route("/inside-view")
 def inside_view():
     try:
-        # Step 1: Capture a fresh image
         image_path = capture_image()
         time.sleep(1.5)
-        
-        # Step 2: Read the captured image and encode it to base64
-        with open(image_path, "rb") as img_file:
-            image_bytes = img_file.read()
-            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        with open(image_path, "rb") as f:
+            base64_img = base64.b64encode(f.read()).decode('utf-8')
+        return jsonify({"status": "success", "image": base64_img})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-        # Step 3: Return the base64 image
-        return jsonify({
-            "status": "success",
-            "image": image_base64
-        })
+@app.route("/door-status")
+def door_status_api():
+    return jsonify({"status": "success", "door_open": get_door_status()})
+
+@app.route("/api/door-open-alert", methods=["POST"])
+def door_open_alert():
+    print("[API] Door open alert received. Send push notification to app here.")
+    return jsonify({"status": "received"}), 200
+
+@app.route("/close-door", methods=["POST"])
+def close_door_api():
+    try:
+        close_door()
+        return jsonify({"status": "success", "message": "Door closed."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+        
+@app.route('/door-lock-status', methods=['GET'])
+def door_lock_status():
+    return jsonify({"locked": door_is_locked})
+        
+@app.route("/lock-door", methods=["POST"])
+def lock_door_api():
+    global door_is_locked
+    try:
+        lock_door()
+        door_is_locked = True
+        return jsonify({"status": "success", "message": "Door locked."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/unlock-door", methods=["POST"])
+def unlock_door_api():
+    global door_is_locked
+    try:
+        unlock_door()
+        door_is_locked = False
+        return jsonify({"status": "success", "message": "Door unlocked."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+        
+@app.route("/register-device", methods=["POST"])
+def register_device():
+    try:
+        data = request.get_json()
+        fcm_token = data.get("fcm_token")
+
+        if not fcm_token:
+            return jsonify({"status": "error", "message": "Missing FCM token"}), 400
+
+        # Save to a local file (or replace with DB logic)
+        with open("fcm_token.txt", "w") as file:
+            file.write(fcm_token)
+
+        print(f"[TOKEN] Registered new device token: {fcm_token}")
+        return jsonify({"status": "success", "message": "FCM token registered."}), 200
 
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-        
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    CORS(app)
+    start_door_monitoring()
     app.run(host="0.0.0.0", port=5000)

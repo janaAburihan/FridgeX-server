@@ -1,0 +1,45 @@
+from flask import Flask, jsonify
+from google.cloud import vision
+import subprocess
+import os
+
+app = Flask(__name__)
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
+
+def capture_image():
+    image_path = "image.jpg"
+    subprocess.run(["libcamera-jpeg", "-o", image_path])
+    return image_path
+
+def detect_labels(image_path):
+    client = vision.ImageAnnotatorClient()
+
+    with open(image_path, "rb") as image_file:
+        content = image_file.read()
+
+    image = vision.Image(content=content)
+    response = client.label_detection(image=image)
+    labels = response.label_annotations
+
+    return [label.description for label in labels]
+
+@app.route("/view-inside")
+def view_inside():
+    try:
+        image_path = capture_image()
+        labels = detect_labels(image_path)
+        return jsonify({
+            "status": "success",
+            "labels": labels
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        })
+
+if __name__ == "__main__":
+    with app.app_context():
+    # view_inside();
+        app.run(host="0.0.0.0", port=5000)
