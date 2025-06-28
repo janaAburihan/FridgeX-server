@@ -13,7 +13,7 @@ gpio_initialized = False
 
 # Initialize Firebase Admin SDK
 try:
-    cred = credentials.Certificate("/home/JSL/Desktop/FridgeX/firebase-adminsdk.json")  
+    cred = credentials.Certificate("/home/JSL/Desktop/FridgeX/fridgex-93c26-firebase-adminsdk-fbsvc-9d9f44769d.json")  
     firebase_admin.initialize_app(cred)
     print("[FIREBASE] Initialized Firebase Admin SDK.")
 except Exception as e:

@@ -11,10 +11,25 @@ from dotenv import load_dotenv
 from flask_cors import CORS
 from openai import OpenAI
 from huggingface_hub import InferenceClient
+import uuid
+import secrets
+import qrcode
 
 from door_monitor import start_door_monitoring, get_door_status
 from door_closing import close_door
 from door_lock import lock_door, unlock_door
+import RPi.GPIO as GPIO
+
+RELAY_PIN = 21  # Or your actual pin number
+
+# Set up GPIO only once at the top (before Flask runs)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, GPIO.LOW)  # Off by default
+
+# QR auth vars
+DEVICE_INFO_FILE = "fridge_identity.json"
+QR_IMAGE_FILE = "fridge_qr.png"
 
 door_is_locked = False
 # Load environment variables
@@ -37,6 +52,36 @@ hf_client = InferenceClient(
 app = Flask(__name__)
 CORS(app)
 
+# QR code auth
+def generate_device_identity():
+    return {
+        "device_id": f"fridge-{uuid.uuid4().hex[:8]}",
+        "auth_key": secrets.token_hex(16)
+    }
+
+def init_identity():
+    # Generate identity once
+    if not os.path.exists(DEVICE_INFO_FILE):
+        device_identity = generate_device_identity()
+        with open(DEVICE_INFO_FILE, "w") as f:
+            json.dump(device_identity, f)
+        print("? New device identity generated.")
+    else:
+        print("?? Device identity already exists.")
+
+    # Generate QR once
+    if not os.path.exists(QR_IMAGE_FILE):
+        with open(DEVICE_INFO_FILE, "r") as f:
+            device_identity = json.load(f)
+        qr = qrcode.make(json.dumps(device_identity))
+        qr.save(QR_IMAGE_FILE)
+        print("? QR code generated.")
+    else:
+        print("?? QR code already exists.")
+
+    with open(DEVICE_INFO_FILE, "r") as f:
+        return json.load(f)
+        
 # Load valid food names
 def load_food_names():
     with open("food_names.txt", "r") as file:
@@ -46,7 +91,16 @@ valid_food_names = load_food_names()
 
 def capture_image():
     image_path = "image.jpg"
+
+    # Turn on the light before capturing
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    time.sleep(0.5)  # Optional delay for light to stabilize
+
     subprocess.run(["libcamera-jpeg", "-o", image_path])
+
+    # Turn off the light after capturing
+    GPIO.output(RELAY_PIN, GPIO.LOW)
+
     return image_path
 
 def detect_labels(image_path):
@@ -209,7 +263,38 @@ def register_device():
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+        
+@app.route("/verify-device", methods=["POST"])
+def verify_device():
+    try:
+        data = request.get_json()
+        scanned_device_id = data.get("device_id")
+        scanned_auth_key = data.get("auth_key")
+        if not scanned_device_id or not scanned_auth_key:
+            return jsonify({"status": "error", "message": "Missing device_id or auth_key"}), 400
+
+        # Load the real device identity from the Pi
+        with open("fridge_identity.json", "r") as f:
+            device_identity = json.load(f)
+        print("gggg1")
+        # Compare
+        if (
+            scanned_device_id == device_identity["device_id"]
+            and scanned_auth_key == device_identity["auth_key"]
+        ):
+            return jsonify({
+                "status": "success",
+                "message": "Device verified successfully.",
+                "device_id": device_identity["device_id"]
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+        
 
 if __name__ == "__main__":
+    device_identity = init_identity()
     start_door_monitoring()
     app.run(host="0.0.0.0", port=5000)
